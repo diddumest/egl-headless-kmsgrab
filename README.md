@@ -28,6 +28,7 @@ For capturing games outside Flatpak runtime, you need native build regardless of
 * libobs
 * libvulkan
 * libgl
+* libegl
 * libX11 (optional)
 * libxcb (optional)
 * libwayland-client (optional)
@@ -36,7 +37,7 @@ For capturing games outside Flatpak runtime, you need native build regardless of
 ## Building
 
     mkdir build && cd build
-    cmake -DCMAKE_INSTALL_PREFIX=/usr ..
+    cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release ..
     make && make install
 
 ## Usage
@@ -45,20 +46,8 @@ For capturing games outside Flatpak runtime, you need native build regardless of
 2. Start the game with capture enabled `obs-gamecapture %command%`.
 3. (Recommended) Start the game with only Vulkan capture enabled `env OBS_VKCAPTURE=1 %command%`.
 
-## Known Issues
-
-* OpenGL GLX capture doesn't work with NVIDIA driver
-
 ## Troubleshooting
 
 **NVIDIA**
 
-Driver version >= 515.43.04 and `nvidia-drm.modeset=1` kernel parameter are required.
-
-**Multiple GPUs**
-
-Try to run both OBS and the game on the same GPU.
-
-**No Game Capture source available in OBS 27**
-
-If you are on X11, make sure you run OBS with EGL enabled: `OBS_USE_EGL=1 obs`.
+Driver version >= 515.43.04 and `nvidia-drm.modeset=1` kernel parameter are required. In Wayland session make sure OBS is running on Wayland and not XWayland.

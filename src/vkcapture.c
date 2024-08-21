@@ -30,6 +30,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #include "utils.h"
 #include "capture.h"
@@ -46,6 +49,18 @@ static struct wl_display *wl_display = NULL;
 static wl_cursor_t *wlcursor = NULL;
 #endif
 
+#include <EGL/egl.h>
+static uint8_t gl_device_uuid[16];
+void (*p_glGetUnsignedBytei_vEXT)(unsigned int target, unsigned int index, unsigned char *data) = NULL;
+
+enum vkcapture_import_attempt {
+    IMPORT_DEFAULT = 0,
+    IMPORT_NO_MODIFIERS = 1,
+    IMPORT_LINEAR = 2,
+    IMPORT_LINEAR_HOST_MAPPED = 3,
+    IMPORT_FAILURES_MAX = IMPORT_LINEAR_HOST_MAPPED,
+};
+
 typedef struct {
     int id;
     int sockfd;
@@ -53,12 +68,17 @@ typedef struct {
     int buf_id;
     int buf_fds[4];
     int import_failures;
+    size_t map_size;
+    void *map_memory;
+    uint64_t timeout;
+    bool unresponsive;
     struct capture_client_data cdata;
     struct capture_texture_data tdata;
 } vkcapture_client_t;
 
 static struct {
-    int quitfd;
+    bool quit;
+    int eventfd;
     pthread_t thread;
     pthread_mutex_t mutex;
     DARRAY(struct pollfd) fds;
@@ -76,6 +96,9 @@ typedef struct {
 #endif
     bool show_cursor;
     bool allow_transparency;
+    bool force_hdr;
+    bool window_match;
+    bool window_exclude;
     const char *window;
 
     int buf_id;
@@ -84,21 +107,58 @@ typedef struct {
 
 } vkcapture_source_t;
 
-static void cursor_create(vkcapture_source_t *ctx)
+static bool server_wakeup();
+
+static const char *import_attempt_str(enum vkcapture_import_attempt attempt)
 {
-#if HAVE_X11_XCB
-    if (obs_get_nix_platform() == OBS_NIX_PLATFORM_X11_EGL) {
-        if (!xcb) {
-            xcb = xcb_connect(NULL, NULL);
-            if (!xcb || xcb_connection_has_error(xcb)) {
-                blog(LOG_ERROR, "Unable to open X display!");
-            }
-        }
-        if (xcb) {
-            ctx->xcursor = xcb_xcursor_init(xcb);
+    switch (attempt) {
+    case IMPORT_DEFAULT: return "default";
+    case IMPORT_NO_MODIFIERS: return "no modifiers";
+    case IMPORT_LINEAR: return "linear";
+    case IMPORT_LINEAR_HOST_MAPPED: return "linear host mapped";
+    default: return "invalid";
+    }
+}
+
+static int64_t clock_ns()
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+static const struct {
+    int32_t drm;
+    enum gs_color_format gs;
+} gs_format_table[] = {
+    { DRM_FORMAT_ARGB8888, GS_BGRA },
+    { DRM_FORMAT_XRGB8888, GS_BGRX },
+    { DRM_FORMAT_ABGR8888, GS_RGBA },
+    { DRM_FORMAT_XBGR8888, GS_RGBA },
+    { DRM_FORMAT_ARGB2101010, GS_R10G10B10A2 },
+    { DRM_FORMAT_XRGB2101010, GS_R10G10B10A2 },
+    { DRM_FORMAT_ABGR2101010, GS_R10G10B10A2 },
+    { DRM_FORMAT_XBGR2101010, GS_R10G10B10A2 },
+    { DRM_FORMAT_ABGR16161616, GS_RGBA16 },
+    { DRM_FORMAT_XBGR16161616, GS_RGBA16 },
+    { DRM_FORMAT_ABGR16161616F, GS_RGBA16F },
+    { DRM_FORMAT_XBGR16161616F, GS_RGBA16F },
+};
+
+static enum gs_color_format drm_format_to_gs(int32_t drm)
+{
+    for (size_t i = 0; i < sizeof(gs_format_table) / sizeof(gs_format_table[0]); ++i) {
+        if (gs_format_table[i].drm == drm) {
+            return gs_format_table[i].gs;
         }
     }
-#endif
+    return GS_UNKNOWN;
+}
+
+static void cursor_create(vkcapture_source_t *ctx)
+{
+    bool try_xcb = false;
+
 #if HAVE_WAYLAND
     if (obs_get_nix_platform() == OBS_NIX_PLATFORM_WAYLAND) {
         if (!wl_display) {
@@ -109,6 +169,22 @@ static void cursor_create(vkcapture_source_t *ctx)
         }
         if (wl_display && !wlcursor) {
             wlcursor = wl_cursor_init(wl_display);
+            if (!wlcursor) {
+                try_xcb = true;
+            }
+        }
+    }
+#endif
+#if HAVE_X11_XCB
+    if (try_xcb || obs_get_nix_platform() == OBS_NIX_PLATFORM_X11_EGL) {
+        if (!xcb) {
+            xcb = xcb_connect(NULL, NULL);
+            if (!xcb || xcb_connection_has_error(xcb)) {
+                blog(LOG_ERROR, "Unable to open X display!");
+            }
+        }
+        if (xcb) {
+            ctx->xcursor = xcb_xcursor_init(xcb);
         }
     }
 #endif
@@ -248,8 +324,17 @@ static void vkcapture_source_update(void *data, obs_data_t *settings)
 
     ctx->show_cursor = obs_data_get_bool(settings, "show_cursor");
     ctx->allow_transparency = obs_data_get_bool(settings, "allow_transparency");
+    ctx->force_hdr = obs_data_get_bool(settings, "force_hdr");
 
+    ctx->window_match = false;
+    ctx->window_exclude = false;
     ctx->window = obs_data_get_string(settings, "window");
+    if (!strncmp(ctx->window, "exclude=", 8)) {
+        ctx->window_exclude = true;
+        ctx->window = ctx->window + 8;
+    } else {
+        ctx->window_match = true;
+    }
     if (!strlen(ctx->window)) {
         ctx->window = NULL;
     }
@@ -276,7 +361,8 @@ static vkcapture_client_t *find_matching_client(vkcapture_source_t *ctx)
     if (ctx->window) {
         for (size_t i = 0; i < server.clients.num; i++) {
             vkcapture_client_t *c = server.clients.array + i;
-            if (!strcmp(c->cdata.exe, ctx->window)) {
+            bool match = !strcmp(c->cdata.exe, ctx->window);
+            if ((ctx->window_match && match) || (ctx->window_exclude && !match)) {
                 client = c;
                 break;
             }
@@ -300,10 +386,28 @@ static vkcapture_client_t *find_client_by_id(int id)
     return client;
 }
 
+static void fill_capture_control_data(struct capture_control_data *msg, vkcapture_client_t *client)
+{
+    if (!p_glGetUnsignedBytei_vEXT) {
+        obs_enter_graphics();
+        p_glGetUnsignedBytei_vEXT = (typeof(p_glGetUnsignedBytei_vEXT))
+            eglGetProcAddress("glGetUnsignedBytei_vEXT");
+        if (p_glGetUnsignedBytei_vEXT) {
+            p_glGetUnsignedBytei_vEXT(0x9597, 0, gl_device_uuid);
+        }
+        obs_leave_graphics();
+    }
+
+    msg->no_modifiers = !!(client->import_failures == IMPORT_NO_MODIFIERS);
+    msg->linear = !!(client->import_failures == IMPORT_LINEAR
+        || client->import_failures == IMPORT_LINEAR_HOST_MAPPED);
+    msg->map_host = !!(client->import_failures == IMPORT_LINEAR_HOST_MAPPED);
+    memcpy(msg->device_uuid, gl_device_uuid, 16);
+}
+
 static void activate_client(vkcapture_source_t *ctx, vkcapture_client_t *client, bool activate)
 {
-    struct capture_control_data msg;
-    memset(&msg, 0, sizeof(msg));
+    struct capture_control_data msg = {0};
     if (activate && !client->activated++) {
         msg.capturing = 1;
     } else if (!activate && !--client->activated) {
@@ -311,8 +415,7 @@ static void activate_client(vkcapture_source_t *ctx, vkcapture_client_t *client,
     } else {
         return;
     }
-    msg.no_modifiers = client->import_failures == 1 ? 1 : 0;
-    msg.linear = client->import_failures == 2 ? 1 : 0;
+    fill_capture_control_data(&msg, client);
     client->buf_id = 0;
     for (int i = 0; i < 4; ++i) {
         if (client->buf_fds[i] >= 0) {
@@ -325,35 +428,7 @@ static void activate_client(vkcapture_source_t *ctx, vkcapture_client_t *client,
     if (ret != sizeof(msg)) {
         blog(LOG_WARNING, "Socket write error: %s", strerror(errno));
     }
-}
-
-static void vkcapture_source_show(void *data)
-{
-    vkcapture_source_t *ctx = data;
-
-    if (ctx->client_id) {
-        pthread_mutex_lock(&server.mutex);
-        vkcapture_client_t *client = find_client_by_id(ctx->client_id);
-        if (client) {
-            activate_client(ctx, client, true);
-        }
-        pthread_mutex_unlock(&server.mutex);
-    }
-}
-
-static void vkcapture_source_hide(void *data)
-{
-    vkcapture_source_t *ctx = data;
-
-    if (ctx->client_id) {
-        pthread_mutex_lock(&server.mutex);
-        vkcapture_client_t *client = find_client_by_id(ctx->client_id);
-        if (client) {
-            activate_client(ctx, client, false);
-            destroy_texture(ctx);
-        }
-        pthread_mutex_unlock(&server.mutex);
-    }
+    client->timeout = clock_ns() + 5000000000; // 5s timeout
 }
 
 static void vkcapture_source_video_tick(void *data, float seconds)
@@ -388,22 +463,35 @@ static void vkcapture_source_video_tick(void *data, float seconds)
                 blog(LOG_INFO, " [%d] fd:%d stride:%d offset:%d", i, client->buf_fds[i], strides[i], offsets[i]);
             }
 
-            obs_enter_graphics();
-            ctx->texture = gs_texture_create_from_dmabuf(ctx->tdata.width, ctx->tdata.height,
-                    ctx->tdata.format, GS_BGRX, ctx->tdata.nfd, client->buf_fds, strides, offsets,
-                    ctx->tdata.modifier != DRM_FORMAT_MOD_INVALID ? modifiers : NULL);
-            obs_leave_graphics();
+            if (client->import_failures == IMPORT_LINEAR_HOST_MAPPED) {
+                lseek(client->buf_fds[0], 0, SEEK_SET);
+                client->map_size = lseek(client->buf_fds[0], 0, SEEK_END);
+                client->map_memory = mmap(NULL, client->map_size, PROT_READ, MAP_SHARED, client->buf_fds[0], 0);
+                if (client->map_memory == MAP_FAILED) {
+                    client->map_memory = NULL;
+                    blog(LOG_ERROR, "Failed to map dmabuf '%s'", strerror(errno));
+                } else {
+                    obs_enter_graphics();
+                    ctx->texture = gs_texture_create(ctx->tdata.width, ctx->tdata.height,
+                        drm_format_to_gs(ctx->tdata.format), 1, NULL, GS_DYNAMIC);
+                    obs_leave_graphics();
+                }
+            } else {
+                obs_enter_graphics();
+                ctx->texture = gs_texture_create_from_dmabuf(ctx->tdata.width, ctx->tdata.height,
+                    ctx->tdata.format, drm_format_to_gs(ctx->tdata.format), ctx->tdata.nfd, client->buf_fds,
+                    strides, offsets, ctx->tdata.modifier != DRM_FORMAT_MOD_INVALID ? modifiers : NULL);
+                obs_leave_graphics();
+            }
 
             if (!ctx->texture) {
-                if (client->import_failures < 2) {
-                    blog(LOG_WARNING, "Asking client to create texture %s",
-                        client->import_failures == 0 ? "without modifiers" : "linear");
+                if (client->import_failures < IMPORT_FAILURES_MAX) {
                     client->import_failures++;
-                    struct capture_control_data msg;
-                    memset(&msg, 0, sizeof(msg));
+                    blog(LOG_WARNING, "Asking client to create texture %s",
+                        import_attempt_str(client->import_failures));
+                    struct capture_control_data msg = {0};
                     msg.capturing = client->activated ? 1 : 0;
-                    msg.no_modifiers = client->import_failures == 1 ? 1 : 0;
-                    msg.linear = client->import_failures == 2 ? 1 : 0;
+                    fill_capture_control_data(&msg, client);
                     ssize_t ret = write(client->sockfd, &msg, sizeof(msg));
                     if (ret != sizeof(msg)) {
                         blog(LOG_WARNING, "Socket write error: %s", strerror(errno));
@@ -413,8 +501,15 @@ static void vkcapture_source_video_tick(void *data, float seconds)
                 }
             }
             ctx->buf_id = client->buf_id;
+            client->timeout = 0;
         } else if (client != find_matching_client(ctx)) {
             activate_client(ctx, client, false);
+            ctx->client_id = 0;
+            destroy_texture(ctx);
+        } else if (client->timeout && clock_ns() > client->timeout) {
+            blog(LOG_INFO, "Client %d not responding, disconnecting...", client->id);
+            client->unresponsive = true;
+            server_wakeup();
             ctx->client_id = 0;
             destroy_texture(ctx);
         }
@@ -443,12 +538,46 @@ static void vkcapture_source_render(void *data, gs_effect_t *effect)
         cursor_update(ctx);
     }
 
+    pthread_mutex_lock(&server.mutex);
+    vkcapture_client_t *client = find_client_by_id(ctx->client_id);
+    if (!client) {
+        pthread_mutex_unlock(&server.mutex);
+        return;
+    }
+    void *memory = client->map_memory;
+    int stride = client->tdata.strides[0];
+    int fd = client->buf_fds[0];
+    pthread_mutex_unlock(&server.mutex);
+
+    if (memory) {
+        struct dma_buf_sync sync;
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+        obs_enter_graphics();
+        gs_texture_set_image(ctx->texture, memory, stride, false);
+        obs_leave_graphics();
+
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+
+    const enum gs_color_space color_space = gs_get_color_space();
+    const char *tech_name = "Draw";
+    float multiplier = 1.f;
+
+    if (color_space == GS_CS_709_EXTENDED) {
+        tech_name = "DrawPQ";
+        multiplier = 10000.f / obs_get_video_sdr_white_level();
+    }
+
     effect = obs_get_base_effect(ctx->allow_transparency ? OBS_EFFECT_DEFAULT : OBS_EFFECT_OPAQUE);
 
     gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
     gs_effect_set_texture(image, ctx->texture);
 
-    while (gs_effect_loop(effect, "Draw")) {
+    while (gs_effect_loop(effect, tech_name)) {
+        gs_effect_set_float(gs_effect_get_param_by_name(effect, "multiplier"), multiplier);
         gs_draw_sprite(ctx->texture, ctx->tdata.flip ? GS_FLIP_V : 0, 0, 0);
         if (ctx->allow_transparency && ctx->show_cursor) {
             cursor_render(ctx);
@@ -457,7 +586,14 @@ static void vkcapture_source_render(void *data, gs_effect_t *effect)
 
     if (!ctx->allow_transparency && ctx->show_cursor) {
         effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-        while (gs_effect_loop(effect, "Draw")) {
+        tech_name = "Draw";
+        multiplier = 1.f;
+        if (color_space == GS_CS_709_SCRGB) {
+            tech_name = "DrawMultiply";
+            multiplier = obs_get_video_sdr_white_level() / 80.f;
+        }
+        while (gs_effect_loop(effect, tech_name)) {
+            gs_effect_set_float(gs_effect_get_param_by_name(effect, "multiplier"), multiplier);
             cursor_render(ctx);
         }
     }
@@ -484,6 +620,7 @@ static void vkcapture_source_get_defaults(obs_data_t *defaults)
 {
     obs_data_set_default_bool(defaults, "show_cursor", true);
     obs_data_set_default_bool(defaults, "allow_transparency", false);
+    obs_data_set_default_bool(defaults, "force_hdr", false);
 }
 
 static obs_properties_t *vkcapture_source_get_properties(void *data)
@@ -498,39 +635,65 @@ static obs_properties_t *vkcapture_source_get_properties(void *data)
             OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(p, obs_module_text("CaptureAnyWindow"), "");
 
-    bool window_found = false;
-    pthread_mutex_lock(&server.mutex);
-    for (size_t i = 0; i < server.clients.num; i++) {
-        vkcapture_client_t *client = server.clients.array + i;
-        obs_property_list_add_string(p, client->cdata.exe, client->cdata.exe);
-        if (ctx->window && !strcmp(client->cdata.exe, ctx->window)) {
-            window_found = true;
+    if (ctx) {
+        bool window_found = false;
+        pthread_mutex_lock(&server.mutex);
+        for (size_t i = 0; i < server.clients.num; i++) {
+            vkcapture_client_t *client = server.clients.array + i;
+            obs_property_list_add_string(p, client->cdata.exe, client->cdata.exe);
+            if (ctx->window && !strcmp(client->cdata.exe, ctx->window)) {
+                window_found = true;
+            }
+        }
+        pthread_mutex_unlock(&server.mutex);
+        if (ctx->window && !window_found) {
+            obs_property_list_add_string(p, ctx->window, ctx->window);
         }
     }
-    pthread_mutex_unlock(&server.mutex);
-    if (ctx->window && !window_found) {
-        obs_property_list_add_string(p, ctx->window, ctx->window);
+
+    size_t count = obs_property_list_item_count(p);
+    for (size_t i = 1; i < count; ++i) {
+        char name[128];
+        char value[128];
+        const char *item = obs_property_list_item_string(p, i);
+        snprintf(name, sizeof(name), "%s %s", obs_module_text("CaptureAnyWindowExcept"), item);
+        snprintf(value, sizeof(value), "exclude=%s", obs_property_list_item_string(p, i));
+        obs_property_list_add_string(p, name, value);
     }
 
-    if (cursor_enabled(ctx)) {
+    if (!ctx || cursor_enabled(ctx)) {
         obs_properties_add_bool(props, "show_cursor", obs_module_text("CaptureCursor"));
     }
 
     obs_properties_add_bool(props, "allow_transparency", obs_module_text("AllowTransparency"));
+    obs_properties_add_bool(props, "force_hdr", obs_module_text("ForceHDR"));
 
     return props;
+}
+
+enum gs_color_space vkcapture_get_color_space(void *data, size_t count, const enum gs_color_space *preferred_spaces)
+{
+    vkcapture_source_t *ctx = data;
+
+    enum gs_color_space color_space = ctx->tdata.color_space;
+
+    if (ctx->force_hdr) {
+        color_space = GS_CS_709_EXTENDED;
+    }
+
+    UNUSED_PARAMETER(count);
+    UNUSED_PARAMETER(preferred_spaces);
+    return color_space;
 }
 
 static struct obs_source_info vkcapture_input = {
     .id = "vkcapture-source",
     .type = OBS_SOURCE_TYPE_INPUT,
     .get_name = vkcapture_source_get_name,
-    .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+    .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
     .create = vkcapture_source_create,
     .destroy = vkcapture_source_destroy,
     .update = vkcapture_source_update,
-    .show = vkcapture_source_show,
-    .hide = vkcapture_source_hide,
     .video_tick = vkcapture_source_video_tick,
     .video_render = vkcapture_source_render,
     .get_width = vkcapture_source_get_width,
@@ -538,7 +701,14 @@ static struct obs_source_info vkcapture_input = {
     .get_defaults = vkcapture_source_get_defaults,
     .get_properties = vkcapture_source_get_properties,
     .icon_type = OBS_ICON_TYPE_GAME_CAPTURE,
+    .video_get_color_space = vkcapture_get_color_space,
 };
+
+static bool server_wakeup()
+{
+    uint64_t q = 1;
+    return write(server.eventfd, &q, sizeof(q)) == sizeof(q);
+}
 
 static void server_add_fd(int fd, int events)
 {
@@ -574,8 +744,15 @@ static void server_cleanup_client(vkcapture_client_t *client)
 {
     pthread_mutex_lock(&server.mutex);
 
+    blog(LOG_INFO, "Client %d disconnected", client->id);
+
     close(client->sockfd);
     server_remove_fd(client->sockfd);
+
+    if (client->map_memory) {
+        munmap(client->map_memory, client->map_size);
+        client->map_memory = NULL;
+    }
 
     for (int i = 0; i < 4; ++i) {
         if (client->buf_fds[i] >= 0) {
@@ -618,7 +795,7 @@ static void *server_thread_run(void *data)
     }
 
     server_add_fd(sockfd, POLLIN);
-    server_add_fd(server.quitfd, POLLIN);
+    server_add_fd(server.eventfd, POLLIN);
 
     while (true) {
         int ret = poll(server.fds.array, server.fds.num, -1);
@@ -626,15 +803,20 @@ static void *server_thread_run(void *data)
             continue;
         }
 
-        if (server_has_event_on_fd(server.quitfd)) {
-            break;
+        if (server_has_event_on_fd(server.eventfd)) {
+            uint64_t q;
+            if (read(server.eventfd, &q, sizeof(q)) != sizeof(q)) {
+                blog(LOG_ERROR, "Failed to read from eventfd %s", strerror(errno));
+            }
+            if (server.quit) {
+                break;
+            }
         }
 
         if (server_has_event_on_fd(sockfd)) {
             int clientfd = accept4(sockfd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
             if (clientfd >= 0) {
-                vkcapture_client_t client;
-                memset(&client, 0, sizeof(client));
+                vkcapture_client_t client = {0};
                 memset(&client.buf_fds, -1, sizeof(client.buf_fds));
                 client.id = ++clientid;
                 client.sockfd = clientfd;
@@ -642,6 +824,12 @@ static void *server_thread_run(void *data)
                 da_push_back(server.clients, &client);
                 pthread_mutex_unlock(&server.mutex);
                 server_add_fd(client.sockfd, POLLIN);
+                struct ucred cred = {0};
+                socklen_t cred_len = sizeof(cred);
+                if (getsockopt(client.sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) {
+                    blog(LOG_WARNING, "Failed to get socket credentials: %s", strerror(errno));
+                }
+                blog(LOG_INFO, "Client %d connected (pid=%d)", client.id, cred.pid);
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED) {
                     blog(LOG_ERROR, "Cannot accept unix socket: %s", strerror(errno));
@@ -651,6 +839,10 @@ static void *server_thread_run(void *data)
 
         for (size_t i = 0; i < server.clients.num; i++) {
             vkcapture_client_t *client = server.clients.array + i;
+            if (client->unresponsive) {
+                server_cleanup_client(client);
+                continue;
+            }
             if (!server_has_event_on_fd(client->sockfd)) {
                 continue;
             }
@@ -705,8 +897,7 @@ static void *server_thread_run(void *data)
 
                     const size_t nfd = (cmsgh->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int);
 
-                    int buf_fds[4];
-                    memset(buf_fds, -1, sizeof(buf_fds));
+                    int buf_fds[4] = {-1, -1, -1, -1};
                     for (size_t i = 0; i < nfd; ++i) {
                         buf_fds[i] = ((int*)CMSG_DATA(cmsgh))[i];
                     }
@@ -748,7 +939,7 @@ static void *server_thread_run(void *data)
 bool obs_module_load(void)
 {
     enum obs_nix_platform_type platform = obs_get_nix_platform();
-#if HAVE_WAYLAND
+#if HAVE_WAYLAND || LIBOBS_API_MAJOR_VER >= 30
     if (platform != OBS_NIX_PLATFORM_X11_EGL && platform != OBS_NIX_PLATFORM_WAYLAND) {
 #else
     if (platform != OBS_NIX_PLATFORM_X11_EGL) {
@@ -757,8 +948,8 @@ bool obs_module_load(void)
         return false;
     }
 
-    server.quitfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (server.quitfd < 0) {
+    server.eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (server.eventfd < 0) {
         blog(LOG_ERROR, "Failed to create eventfd: %s", strerror(errno));
         return false;
     }
@@ -768,6 +959,7 @@ bool obs_module_load(void)
         blog(LOG_ERROR, "Failed to create thread");
         return false;
     }
+    pthread_setname_np(server.thread, PLUGIN_NAME);
 
     obs_register_source(&vkcapture_input);
     blog(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
@@ -777,8 +969,8 @@ bool obs_module_load(void)
 
 void obs_module_unload()
 {
-    uint64_t q = 1;
-    if (write(server.quitfd, &q, sizeof(q)) == sizeof(q)) {
+    server.quit = true;
+    if (server_wakeup()) {
         pthread_join(server.thread, NULL);
     }
 
@@ -786,4 +978,15 @@ void obs_module_unload()
 }
 
 OBS_DECLARE_MODULE()
+OBS_MODULE_AUTHOR("David Rosca <nowrep@gmail.com>")
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+
+MODULE_EXPORT const char *obs_module_name(void)
+{
+    return PLUGIN_NAME;
+}
+
+MODULE_EXPORT const char *obs_module_description(void)
+{
+    return obs_module_text("Description");
+}

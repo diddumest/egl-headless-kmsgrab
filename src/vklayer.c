@@ -63,7 +63,8 @@ struct vk_swap_data {
 
     VkExtent2D image_extent;
     VkFormat format;
-    uint32_t winid;
+    VkColorSpaceKHR color_space;
+    uint64_t winid;
     VkImage export_image;
     VkFormat export_format;
     VkDeviceMemory export_mem;
@@ -99,7 +100,7 @@ struct vk_frame_data {
 struct vk_surf_data {
     struct vk_obj_node node;
 
-    uint32_t winid;
+    uint64_t winid;
 };
 
 struct vk_inst_data {
@@ -117,6 +118,8 @@ struct vk_data {
     struct vk_obj_node node;
 
     VkDevice device;
+    VkDriverId driver_id;
+    uint8_t device_uuid[16];
 
     bool valid;
 
@@ -142,7 +145,7 @@ static void *vk_alloc(const VkAllocationCallbacks *ac, size_t size,
         size_t alignment, enum VkSystemAllocationScope scope)
 {
     return ac ? ac->pfnAllocation(ac->pUserData, size, alignment, scope)
-        : aligned_alloc(alignment, size);
+        : malloc(size);
 }
 
 static void vk_free(const VkAllocationCallbacks *ac, void *memory)
@@ -272,12 +275,6 @@ static struct vk_data *remove_device_data(VkDevice device)
             (uintptr_t)GET_LDT(device));
 }
 
-static void free_device_data(struct vk_data *data,
-        const VkAllocationCallbacks *ac)
-{
-    vk_free(ac, data);
-}
-
 /* ------------------------------------------------------------------------- */
 
 static struct vk_queue_data *add_queue_data(struct vk_data *data, VkQueue queue,
@@ -305,11 +302,6 @@ static struct vk_queue_data *get_queue_data(struct vk_data *data, VkQueue queue)
 {
     return (struct vk_queue_data *)get_obj_data(&data->queues,
             (uintptr_t)queue);
-}
-
-static VkQueue get_queue_key(const struct vk_queue_data *queue_data)
-{
-    return (VkQueue)(uintptr_t)queue_data->node.obj;
 }
 
 static void remove_free_queue_all(struct vk_data *data,
@@ -470,7 +462,7 @@ static void vk_shtex_free(struct vk_data *data)
 /* ------------------------------------------------------------------------- */
 
 static void add_surf_data(struct vk_inst_data *idata, VkSurfaceKHR surf,
-        uint32_t winid, const VkAllocationCallbacks *ac)
+        uint64_t winid, const VkAllocationCallbacks *ac)
 {
     struct vk_surf_data *surf_data = vk_alloc(
             ac, sizeof(struct vk_surf_data), _Alignof(struct vk_surf_data),
@@ -482,7 +474,7 @@ static void add_surf_data(struct vk_inst_data *idata, VkSurfaceKHR surf,
     }
 }
 
-static uint32_t find_surf_winid(struct vk_inst_data *idata, VkSurfaceKHR surf)
+static uint64_t find_surf_winid(struct vk_inst_data *idata, VkSurfaceKHR surf)
 {
     struct vk_surf_data *surf_data = (struct vk_surf_data *)get_obj_data(
             &idata->surfaces, (uint64_t)surf);
@@ -555,27 +547,62 @@ static void remove_free_inst_data(VkInstance inst,
 /* ======================================================================== */
 /* capture                                                                  */
 
-static bool vk_format_requires_conversion(VkFormat format)
+static bool allow_modifier(struct vk_data *data, uint64_t modifier)
 {
-    switch (format) {
-    case VK_FORMAT_B8G8R8A8_UNORM:
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_SRGB:
-    case VK_FORMAT_R8G8B8A8_SRGB:
-        return false;
-    default:
-        return true;
+    /* DCC modifiers doesn't work when importing on radeonsi with amdvlk/amdpro drivers */
+    if (data->driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE || data->driver_id == VK_DRIVER_ID_AMD_PROPRIETARY) {
+        return !IS_AMD_FMT_MOD(modifier) || !AMD_FMT_MOD_GET(DCC, modifier);
     }
+    return true;
 }
 
-static bool vk_format_is_bgra(VkFormat format)
+static const struct {
+    int32_t drm;
+    VkFormat vk;
+} vk_format_table[] = {
+    { DRM_FORMAT_ARGB8888, VK_FORMAT_B8G8R8A8_UNORM },
+    { DRM_FORMAT_ARGB8888, VK_FORMAT_B8G8R8A8_SRGB },
+    { DRM_FORMAT_XRGB8888, VK_FORMAT_B8G8R8A8_UNORM },
+    { DRM_FORMAT_XRGB8888, VK_FORMAT_B8G8R8A8_SRGB },
+    { DRM_FORMAT_ABGR8888, VK_FORMAT_R8G8B8A8_UNORM },
+    { DRM_FORMAT_ABGR8888, VK_FORMAT_R8G8B8A8_SRGB },
+    { DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_UNORM },
+    { DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_SRGB },
+    { DRM_FORMAT_ARGB2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
+    { DRM_FORMAT_XRGB2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
+    { DRM_FORMAT_ABGR2101010, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
+    { DRM_FORMAT_XBGR2101010, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
+    { DRM_FORMAT_ABGR16161616, VK_FORMAT_R16G16B16A16_UNORM },
+    { DRM_FORMAT_XBGR16161616, VK_FORMAT_R16G16B16A16_UNORM },
+    { DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT },
+    { DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT },
+};
+
+static int32_t vk_format_to_drm(VkFormat vk)
 {
-    switch (format) {
-    case VK_FORMAT_B8G8R8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_SRGB:
-        return true;
+    for (size_t i = 0; i < sizeof(vk_format_table) / sizeof(vk_format_table[0]); ++i) {
+        if (vk_format_table[i].vk == vk) {
+            return vk_format_table[i].drm;
+        }
+    }
+    return -1;
+}
+
+static uint32_t vk_color_space_to_obs(VkColorSpaceKHR vk)
+{
+    const char *force = getenv("OBS_VKCAPTURE_COLOR_SPACE");
+    if (force) {
+        int value = atoi(force);
+        if (value >= 0 && value < 3) {
+            return value;
+        }
+    }
+    switch (vk) {
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        return 2; // GS_CS_709_EXTENDED
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
     default:
-        return false;
+        return 0; // GS_CS_SRGB
     }
 }
 
@@ -588,19 +615,29 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 
     const bool no_modifiers = capture_allocate_no_modifiers();
     const bool linear = vkcapture_linear || capture_allocate_linear();
+    const bool map_host = capture_allocate_map_host();
+    const bool same_device = capture_compare_device_uuid(data->device_uuid);
 
     hlog("Texture %s %ux%u", vk_format_to_str(swap->format), swap->image_extent.width, swap->image_extent.height);
 
-    if (!vk_format_requires_conversion(swap->format)) {
+    if (vk_format_to_drm(swap->format) != -1) {
         swap->export_format = swap->format;
     } else {
         swap->export_format = VK_FORMAT_B8G8R8A8_UNORM;
         hlog("Converting to %s", vk_format_to_str(swap->export_format));
     }
 
-    // create image (for dedicated allocation)
+    if (!same_device) {
+        hlog("OBS is running on different GPU");
+    }
+
+    VkExternalMemoryImageCreateInfo ext_mem_image_info = {};
+    ext_mem_image_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext_mem_image_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
     VkImageCreateInfo img_info = {};
     img_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_info.pNext = &ext_mem_image_info;
     img_info.imageType = VK_IMAGE_TYPE_2D;
     img_info.format = swap->export_format;
     img_info.mipLevels = 1;
@@ -647,6 +684,10 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
             if (linear && modifier_props[i].drmFormatModifier != DRM_FORMAT_MOD_LINEAR) {
                 continue;
             }
+            if (!allow_modifier(data, modifier_props[i].drmFormatModifier)) {
+                continue;
+            }
+
             VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {};
             mod_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
             mod_info.drmFormatModifier = modifier_props[i].drmFormatModifier;
@@ -690,12 +731,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
             image_modifier_list.drmFormatModifierCount = modifier_prop_count;
             image_modifier_list.pDrmFormatModifiers = image_modifiers;
             img_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-            img_info.pNext = &image_modifier_list;
-
-            VkExternalMemoryImageCreateInfo ext_mem_image_info = {};
-            ext_mem_image_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-            ext_mem_image_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-            image_modifier_list.pNext = &ext_mem_image_info;
+            ext_mem_image_info.pNext = &image_modifier_list;
         } else {
             hlog("No suitable DRM modifier found!");
         }
@@ -746,7 +782,10 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
     memi.allocationSize = memr.memoryRequirements.size;
 
     bool allocated = false;
-    uint32_t mem_req_bits = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t mem_req_bits = same_device ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    if (map_host) {
+        mem_req_bits = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
     for (uint32_t i = 0; i < pdmp.memoryTypeCount; ++i) {
         if ((memr.memoryRequirements.memoryTypeBits & (1 << i)) &&
                 (pdmp.memoryTypes[i].propertyFlags &
@@ -759,7 +798,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
             hlog("AllocateMemory failed (DEVICE_LOCAL): %s", result_to_str(res));
         }
     }
-    if (!allocated) {
+    if (!allocated && !map_host) {
         /* Try again without DEVICE_LOCAL */
         for (uint32_t i = 0; i < pdmp.memoryTypeCount; ++i) {
             if ((memr.memoryRequirements.memoryTypeBits & (1 << i)) &&
@@ -866,9 +905,10 @@ static bool vk_shtex_init(struct vk_data *data, struct vk_swap_data *swap)
     data->cur_swap = swap;
 
     capture_init_shtex(swap->image_extent.width, swap->image_extent.height,
-        vk_format_is_bgra(swap->export_format) ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888,
+        vk_format_to_drm(swap->export_format),
         swap->dmabuf_strides, swap->dmabuf_offsets, swap->dmabuf_modifier,
-        swap->winid, /*flip*/false, swap->dmabuf_nfd, swap->dmabuf_fds);
+        swap->winid, /*flip*/false, vk_color_space_to_obs(swap->color_space),
+        swap->dmabuf_nfd, swap->dmabuf_fds);
 
     hlog("------------------ vulkan capture started ------------------");
     return true;
@@ -1335,6 +1375,11 @@ static VkResult VKAPI_CALL OBS_CreateInstance(const VkInstanceCreateInfo *info,
         }                                       \
     } while (false)
 
+#define GETADDR_IF_SUPPORTED(x)                                      \
+    do {                                            \
+        ifuncs->x = (PFN_vk##x)gpa(inst, "vk" #x); \
+    } while (false)
+
     bool funcs_found = true;
     GETADDR(GetInstanceProcAddr);
     GETADDR(DestroyInstance);
@@ -1342,14 +1387,18 @@ static VkResult VKAPI_CALL OBS_CreateInstance(const VkInstanceCreateInfo *info,
     GETADDR(GetPhysicalDeviceMemoryProperties);
     GETADDR(GetPhysicalDeviceFormatProperties2KHR);
     GETADDR(GetPhysicalDeviceImageFormatProperties2KHR);
+    GETADDR(GetPhysicalDeviceProperties2KHR);
     GETADDR(EnumerateDeviceExtensionProperties);
 #if HAVE_X11_XCB
-    GETADDR(CreateXcbSurfaceKHR);
+    GETADDR_IF_SUPPORTED(CreateXcbSurfaceKHR);
 #endif
 #if HAVE_X11_XLIB
-    GETADDR(CreateXlibSurfaceKHR);
+    GETADDR_IF_SUPPORTED(CreateXlibSurfaceKHR);
 #endif
-    GETADDR(DestroySurfaceKHR);
+#if HAVE_WAYLAND
+    GETADDR_IF_SUPPORTED(CreateWaylandSurfaceKHR);
+#endif
+    GETADDR_IF_SUPPORTED(DestroySurfaceKHR);
 #undef GETADDR
 
     valid = valid && funcs_found;
@@ -1407,8 +1456,9 @@ static VkResult VKAPI_CALL OBS_CreateDevice(VkPhysicalDevice phy_device,
         VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
         VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME,
     };
-    static uint32_t req_extensions_count = 10;
+    static uint32_t req_extensions_count = 11;
 
     int new_count = info->enabledExtensionCount + req_extensions_count;
     const char **exts = (const char**)malloc(sizeof(char*) * new_count);
@@ -1632,6 +1682,21 @@ static VkResult VKAPI_CALL OBS_CreateDevice(VkPhysicalDevice phy_device,
     init_obj_list(&data->swaps);
     data->cur_swap = NULL;
 
+    VkPhysicalDeviceDriverProperties propsDriver = {};
+    propsDriver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+    VkPhysicalDeviceIDProperties propsID = {};
+    propsID.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    propsID.pNext = &propsDriver;
+
+    VkPhysicalDeviceProperties2 props = {};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &propsID;
+    ifuncs->GetPhysicalDeviceProperties2KHR(phy_device, &props);
+
+    data->driver_id = propsDriver.driverID;
+    memcpy(data->device_uuid, propsID.deviceUUID, 16);
+
     data->valid = true;
 
     return ret;
@@ -1707,6 +1772,7 @@ OBS_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *cinfo,
 #endif
             swap_data->image_extent = cinfo->imageExtent;
             swap_data->format = cinfo->imageFormat;
+            swap_data->color_space = cinfo->imageColorSpace;
             swap_data->winid = find_surf_winid(data->inst_data, cinfo->surface);
             swap_data->export_image = VK_NULL_HANDLE;
             swap_data->export_mem = VK_NULL_HANDLE;
@@ -1787,6 +1853,26 @@ static VkResult VKAPI_CALL OBS_CreateXlibSurfaceKHR(
 }
 #endif
 
+#if HAVE_WAYLAND
+static VkResult VKAPI_CALL OBS_CreateWaylandSurfaceKHR(
+        VkInstance inst, const VkWaylandSurfaceCreateInfoKHR *info,
+        const VkAllocationCallbacks *ac, VkSurfaceKHR *surf)
+{
+#ifndef NDEBUG
+    hlog("CreateWaylandSurfaceKHR");
+#endif
+
+    struct vk_inst_data *idata = get_inst_data(inst);
+    struct vk_inst_funcs *ifuncs = &idata->funcs;
+
+    VkResult res = ifuncs->CreateWaylandSurfaceKHR(inst, info, ac, surf);
+    if ((res == VK_SUCCESS) && idata->valid) {
+        add_surf_data(idata, *surf, (uintptr_t)info->surface, ac);
+    }
+    return res;
+}
+#endif
+
 static void VKAPI_CALL OBS_DestroySurfaceKHR(VkInstance inst, VkSurfaceKHR surf,
         const VkAllocationCallbacks *ac)
 {
@@ -1810,7 +1896,7 @@ static void VKAPI_CALL OBS_DestroySurfaceKHR(VkInstance inst, VkSurfaceKHR surf,
 
 #define GETPROCADDR_IF_SUPPORTED(func)  \
     if (!strcmp(pName, "vk" #func)) \
-    return funcs->func ? (PFN_vkVoidFunction)&OBS_##func : NULL;
+    return funcs && funcs->func ? (PFN_vkVoidFunction)&OBS_##func : NULL;
 
 static PFN_vkVoidFunction VKAPI_CALL OBS_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
@@ -1828,40 +1914,13 @@ static PFN_vkVoidFunction VKAPI_CALL OBS_GetDeviceProcAddr(VkDevice device, cons
     return funcs->GetDeviceProcAddr(device, pName);
 }
 
-/* bad layers require spec violation */
-#define RETURN_FP_FOR_NULL_INSTANCE 1
-
 static PFN_vkVoidFunction VKAPI_CALL OBS_GetInstanceProcAddr(VkInstance instance, const char *pName)
 {
     /* instance chain functions we intercept */
     GETPROCADDR(GetInstanceProcAddr);
     GETPROCADDR(CreateInstance);
 
-#if RETURN_FP_FOR_NULL_INSTANCE
-    /* other instance chain functions we intercept */
-    GETPROCADDR(DestroyInstance);
-#if HAVE_X11_XCB
-    GETPROCADDR(CreateXcbSurfaceKHR);
-#endif
-#if HAVE_X11_XLIB
-    GETPROCADDR(CreateXlibSurfaceKHR);
-#endif
-    GETPROCADDR(DestroySurfaceKHR);
-
-    /* device chain functions we intercept */
-    GETPROCADDR(GetDeviceProcAddr);
-    GETPROCADDR(CreateDevice);
-    GETPROCADDR(DestroyDevice);
-
-    if (instance == NULL)
-        return NULL;
-
-    struct vk_inst_funcs *const funcs = get_inst_funcs(instance);
-#else
-    if (instance == NULL)
-        return NULL;
-
-    struct vk_inst_funcs *const funcs = get_inst_funcs(instance);
+    struct vk_inst_funcs *const funcs = instance ? get_inst_funcs(instance) : NULL;
 
     /* other instance chain functions we intercept */
     GETPROCADDR(DestroyInstance);
@@ -1871,13 +1930,18 @@ static PFN_vkVoidFunction VKAPI_CALL OBS_GetInstanceProcAddr(VkInstance instance
 #if HAVE_X11_XLIB
     GETPROCADDR_IF_SUPPORTED(CreateXlibSurfaceKHR);
 #endif
+#if HAVE_WAYLAND
+    GETPROCADDR_IF_SUPPORTED(CreateWaylandSurfaceKHR);
+#endif
     GETPROCADDR_IF_SUPPORTED(DestroySurfaceKHR);
 
     /* device chain functions we intercept */
     GETPROCADDR(GetDeviceProcAddr);
     GETPROCADDR(CreateDevice);
     GETPROCADDR(DestroyDevice);
-#endif
+
+    if (!funcs)
+        return NULL;
 
     const PFN_vkGetInstanceProcAddr gipa = funcs->GetInstanceProcAddr;
     return gipa ? gipa(instance, pName) : NULL;
@@ -1885,7 +1949,7 @@ static PFN_vkVoidFunction VKAPI_CALL OBS_GetInstanceProcAddr(VkInstance instance
 
 #undef GETPROCADDR
 
-VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL OBS_Negotiate(VkNegotiateLayerInterface *nli)
+VKAPI_ATTR VkResult VKAPI_CALL OBS_Negotiate(VkNegotiateLayerInterface *nli)
 {
     if (nli->loaderLayerInterfaceVersion >= 2) {
         nli->sType = LAYER_NEGOTIATE_INTERFACE_STRUCT;
@@ -1902,7 +1966,12 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL OBS_Negotiate(VkNegotiateLayerInt
     }
 
     if (!vulkan_seen) {
-        hlog("Init Vulkan %s", PLUGIN_VERSION);
+        hlog("Init Vulkan %s (%s)", PLUGIN_VERSION,
+#ifdef __x86_64__
+            "64bit");
+#else
+            "32bit");
+#endif
         init_obj_list(&instances);
         init_obj_list(&devices);
         capture_init();

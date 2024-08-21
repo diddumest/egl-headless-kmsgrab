@@ -8,7 +8,8 @@ if [ "$#" -eq 0 ]; then
     exit 1
 fi
 
-exec env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}@CMAKE_INSTALL_PREFIX@/\$LIB" \
-	LD_PRELOAD="${LD_PRELOAD}${LD_PRELOAD:+:}libobs_glcapture.so" \
-	OBS_VKCAPTURE=1 \
-	"$@"
+OBS_GLCAPTURE_LIB="@CMAKE_INSTALL_PREFIX@/\$LIB/obs_glcapture/libobs_glcapture.so"
+
+exec env LD_PRELOAD="${LD_PRELOAD}${LD_PRELOAD:+:}${OBS_GLCAPTURE_LIB}" \
+    OBS_VKCAPTURE=1 \
+    "$@"
