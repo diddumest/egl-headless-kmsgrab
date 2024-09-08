@@ -41,6 +41,7 @@ static int monitor_crtc(int fd, struct crtc *crtc) {
 int *dma_buf_fd;
 void initDmaBufFDs(int drmfd, drmModeFB2Ptr fb, int *dma_buf_fd, int *nplanes) {
   for (int i = 0; i < 4; i++) {
+//  printf("Handle ID:%d Handle:%x\n", i, fb->handles[i] );
     if (fb->handles[i] == 0) {
       *nplanes = i;
       break;
@@ -67,23 +68,30 @@ static void handle_sequence(int fd, uint64_t seq, uint64_t ns, uint64_t data) {
   crtc->ns = ns;
 
   monitor_crtc(fd, crtc);
-  
+
+  if (crtc->id != 105) {
   //prepareImage(fd);
   drmModeCrtcPtr crtc_my = drmModeGetCrtc(fd, crtc->id);
   if (crtc_my) {
     drmModeFB2Ptr fb = drmModeGetFB2(fd, crtc_my->buffer_id);
     drmModeFreeCrtc(crtc_my);
     
-    //printf("crtc id %d\n", crtc->id);
+    printf("crtc id %d\n", crtc->id);
     if (fb) {
       int nplanes = 0;
       initDmaBufFDs(fd, fb, dma_buf_fd, &nplanes);
-      
+     /**
+       void capture_init_shtex(
+        int width, int height, int format, int strides[4],
+        int offsets[4], uint64_t modifier, uint32_t winid,
+        bool flip, uint32_t color_space, int nfd, int fds[4]);
+**/
       capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
-                         fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
+                         fb->offsets, fb->modifier, 0, false, 16,nplanes, dma_buf_fd);
       cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
       // capture_update_socket();
     }
+  }
   }
 }
 
