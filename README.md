@@ -6,6 +6,21 @@ sudo vkcapture-kmsgrab
 
 In list of vkcapture sources you will find "vkcapture-kmsgrab", which is fullscreen capture, universal to X11, Wayland, and even virtual console.
 
+To select different video card, use `-d` argument: 
+```
+sudo vkcapture-kmsgrab -d /dev/dri/card1
+```
+
+To select exact display, first run OBS and then `sudo vkcapture-kmsgrab`. Examine which CRTC looks like your display and select it with `-c` argument:
+```
+sudo vkcapture-kmsgrab -c 170
+```
+
+To allow utility to run without root, find vkcapture executable with `whereis vkcapture-kmsgrab` and run:
+```
+sudo setcap cap_sys_admin+ep /usr/bin/vkcapture-kmsgrab
+```
+
 # OBS Linux Vulkan/OpenGL game capture
 
 OBS plugin for Vulkan/OpenGL game capture on Linux.
