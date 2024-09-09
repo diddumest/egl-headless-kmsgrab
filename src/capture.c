@@ -35,7 +35,9 @@ static struct {
     bool capturing;
     bool no_modifiers;
     bool linear;
+    bool map_host;
     bool need_reinit;
+    uint8_t device_uuid[16];
 } data;
 
 static bool get_wine_exe(char *buf, size_t bufsize)
@@ -131,11 +133,15 @@ void capture_update_socket()
     if (n == sizeof(control)) {
         const bool old_no_modifiers = data.no_modifiers;
         const bool old_linear = data.linear;
+        const bool old_map_host = data.map_host;
         data.accepted = control.capturing == 1;
         data.no_modifiers = control.no_modifiers == 1;
         data.linear = control.linear == 1;
+        data.map_host = control.map_host == 1;
+        memcpy(data.device_uuid, control.device_uuid, 16);
         if (data.capturing && (old_no_modifiers != data.no_modifiers
-            || old_linear != data.linear)) {
+            || old_linear != data.linear
+            || old_map_host != data.map_host)) {
             data.need_reinit = true;
         }
     }
@@ -157,9 +163,9 @@ void capture_update_socket()
 void capture_init_shtex(
         int width, int height, int format, int strides[4],
         int offsets[4], uint64_t modifier, uint32_t winid,
-        bool flip, int nfd, int fds[4])
+        bool flip, uint32_t color_space, int nfd, int fds[4])
 {
-    struct capture_texture_data td;
+    struct capture_texture_data td = {0};
     td.type = CAPTURE_TEXTURE_DATA_TYPE;
     td.nfd = nfd;
     td.width = width;
@@ -170,6 +176,7 @@ void capture_init_shtex(
     td.modifier = modifier;
     td.winid = winid;
     td.flip = flip;
+    td.color_space = color_space;
 
     struct msghdr msg = {0};
 
@@ -226,4 +233,14 @@ bool capture_allocate_no_modifiers()
 bool capture_allocate_linear()
 {
     return data.linear;
+}
+
+bool capture_allocate_map_host()
+{
+    return data.map_host;
+}
+
+bool capture_compare_device_uuid(uint8_t uuid[16])
+{
+    return memcmp(data.device_uuid, uuid, 16) == 0;
 }

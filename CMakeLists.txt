@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(obs-vkcapture VERSION 1.3.0)
+project(obs-vkcapture
+   LANGUAGES C
+   VERSION 1.5.1)
 
 include(GNUInstallDirs)
 find_package(Vulkan REQUIRED)
 set(OpenGL_GL_PREFERENCE LEGACY)
 find_package(OpenGL REQUIRED)
 find_package(PkgConfig)
+pkg_check_modules(EGL egl IMPORTED_TARGET)
 pkg_check_modules(X11 x11 IMPORTED_TARGET)
 pkg_check_modules(XCB xcb IMPORTED_TARGET)
 pkg_check_modules(XCB_XFIXES xcb-xfixes IMPORTED_TARGET)
@@ -44,13 +47,16 @@ endif()
 set(CMAKE_C_STANDARD 11)
 
 if (BUILD_PLUGIN)
+    if (NOT TARGET OBS::libobs)
+        find_package(libobs QUIET)
+    endif()
     if (NOT TARGET libobs)
         find_package(LibObs QUIET)
     endif()
-    if (TARGET libobs)
-        set(PLUGIN_LIBS libobs)
-    elseif(TARGET OBS::libobs)
+    if (TARGET OBS::libobs)
         set(PLUGIN_LIBS OBS::libobs)
+    elseif (TARGET libobs)
+        set(PLUGIN_LIBS libobs)
     else()
         pkg_check_modules(LIBOBS libobs IMPORTED_TARGET REQUIRED)
         set(PLUGIN_LIBS PkgConfig::LIBOBS)
@@ -60,7 +66,7 @@ if (BUILD_PLUGIN)
     endif()
 
     set(PLUGIN_SOURCES src/vkcapture.c)
-    set(PLUGIN_LIBS ${PLUGIN_LIBS} obs-frontend-api)
+    set(PLUGIN_LIBS ${PLUGIN_LIBS} obs-frontend-api PkgConfig::EGL)
     if (HAVE_X11_XCB)
         set(PLUGIN_SOURCES ${PLUGIN_SOURCES} src/xcursor-xcb.c)
         set(PLUGIN_LIBS ${PLUGIN_LIBS} PkgConfig::XCB PkgConfig::XCB_XFIXES)
@@ -113,7 +119,10 @@ set(GL_SOURCES src/dlsym.c src/elfhacks.c src/glinject.c src/capture.c)
 add_library(obs_glcapture MODULE ${GL_SOURCES})
 set_target_properties(obs_glcapture PROPERTIES LINK_FLAGS "-Wl,--version-script=\"${CMAKE_CURRENT_SOURCE_DIR}/src/glinject.version\"")
 target_link_libraries(obs_glcapture ${CMAKE_DL_LIBS} OpenGL::GL)
-target_include_directories(obs_glcapture PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
+target_include_directories(obs_glcapture PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+    $<TARGET_PROPERTY:Vulkan::Vulkan,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 configure_file(plugin-macros.h.in ${CMAKE_CURRENT_BINARY_DIR}/plugin-macros.h @ONLY)
 configure_file(src/obs_vkcapture.json.in ${CMAKE_CURRENT_BINARY_DIR}/obs_vkcapture${LAYER_SUFFIX}.json @ONLY)
@@ -123,7 +132,7 @@ install(TARGETS VkLayer_obs_vkcapture
     LIBRARY DESTINATION "${CMAKE_INSTALL_FULL_LIBDIR}")
 
 install(TARGETS obs_glcapture
-    LIBRARY DESTINATION "${CMAKE_INSTALL_FULL_LIBDIR}")
+    LIBRARY DESTINATION "${CMAKE_INSTALL_FULL_LIBDIR}/obs_glcapture")
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/obs_vkcapture${LAYER_SUFFIX}.json
     DESTINATION "${CMAKE_INSTALL_FULL_DATAROOTDIR}/vulkan/implicit_layer.d")

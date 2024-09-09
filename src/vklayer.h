@@ -30,6 +30,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <X11/Xlib.h>
 #include <vulkan/vulkan_xlib.h>
 #endif
+#if HAVE_WAYLAND
+#include <vulkan/vulkan_wayland.h>
+#endif
 
 #ifndef VK_EXT_image_drm_format_modifier
 #define VK_EXT_image_drm_format_modifier 1
@@ -90,12 +93,16 @@ struct vk_inst_funcs {
     DEF_FUNC(GetPhysicalDeviceMemoryProperties);
     DEF_FUNC(GetPhysicalDeviceFormatProperties2KHR);
     DEF_FUNC(GetPhysicalDeviceImageFormatProperties2KHR);
+    DEF_FUNC(GetPhysicalDeviceProperties2KHR);
     DEF_FUNC(EnumerateDeviceExtensionProperties);
 #if HAVE_X11_XCB
     DEF_FUNC(CreateXcbSurfaceKHR);
 #endif
 #if HAVE_X11_XLIB
     DEF_FUNC(CreateXlibSurfaceKHR);
+#endif
+#if HAVE_WAYLAND
+    DEF_FUNC(CreateWaylandSurfaceKHR);
 #endif
     DEF_FUNC(DestroySurfaceKHR);
 };
