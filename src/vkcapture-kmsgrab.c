@@ -79,8 +79,10 @@ static void handle_sequence(int fd, uint64_t seq, uint64_t ns, uint64_t data) {
       int nplanes = 0;
       initDmaBufFDs(fd, fb, dma_buf_fd, &nplanes);
       
-      capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
-                         fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
+      //capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
+      //                   fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
+      capture_init_shtex(fb->width, fb->height, fb->pixel_format, fb->pitches,
+                         fb->offsets, fb->modifier, 0, false, 16, nplanes, dma_buf_fd);
       cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
       // capture_update_socket();
     }
