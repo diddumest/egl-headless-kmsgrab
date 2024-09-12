@@ -3,7 +3,7 @@ pkgbase=${_pkgbase}-git
 pkgname=('obs-vkcapture-git' 'lib32-obs-vkcapture-git')
 pkgver=0.1
 pkgrel=1
-url='https://github.com/nowrep/obs-vkcapture'
+url='https://github.com/scaledteam/obs-vkcapture'
 license=('GPL2')
 arch=('x86_64')
 depends=('vulkan-icd-loader' 'libgl' 'obs-studio>=27')
